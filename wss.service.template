@@ -1,0 +1,31 @@
+[Unit]
+Description=WSS Node.js Proxy Core (Data Plane)
+After=network.target
+After=wss_panel.service
+BindsTo=wss_panel.service
+
+[Service]
+Type=simple
+
+# [AXIOM V2.0.3 BUGFIX]
+# 修复: "wss.service: Failed with result 'exit-code'" 崩溃错误。
+# wss_proxy.js (V2.0) 依赖 'ws' 模块。
+# npm install 将 'ws' 安装在 /etc/wss-panel/node_modules 中。
+# 此服务 (作为 root 运行) 需要 NODE_PATH 才能找到该模块。
+Environment=NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules:/etc/wss-panel/node_modules
+
+# [AXIOM V2.0] 移除所有硬编码的端口/密钥环境变量。
+# 服务将从 /etc/wss-panel/config.json 读取配置。
+# 保留 PANEL_DIR_ENV 是为了帮助进程找到 config.json。
+Environment=PANEL_DIR_ENV=/etc/wss-panel
+
+ExecStart=/usr/bin/node @WSS_PROXY_SCRIPT_PATH@
+Restart=on-failure
+User=root
+StandardOutput=journal
+StandardError=journal
+
+ExecStartPre=/bin/bash -c "touch @WSS_LOG_FILE_PATH@ && chmod 644 @WSS_LOG_FILE_PATH@"
+
+[Install]
+WantedBy=multi-user.target

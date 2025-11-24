@@ -1,0 +1,18 @@
+[Unit]
+Description=UDP Gateway (Badvpn C++)
+After=network.target
+
+[Service]
+Type=simple
+# 运行编译好的二进制文件
+# 参数说明:
+# --listen-addr: 监听地址和端口 (通常是 127.0.0.1:7300)
+# --max-clients: 最大客户端数
+# --max-connections-for-client: 单客户端最大连接数
+# --client-socket-sndbuf: 设置巨大的发送缓冲区 (8MB) 以防止丢包
+ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:@UDPGW_PORT@ --max-clients 9999 --max-connections-for-client 3000 --client-socket-sndbuf 8388608
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target

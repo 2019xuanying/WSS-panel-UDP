@@ -1,0 +1,18 @@
+[Unit]
+Description=UDP Custom Service (HTTP Custom Integration)
+After=network.target
+After=udpgw.service
+Requires=udpgw.service
+
+[Service]
+Type=simple
+# 必须以 root 运行以读取 /etc/shadow 进行密码认证
+User=root
+WorkingDirectory=@UDP_CUSTOM_DIR@
+ExecStart=@UDP_CUSTOM_BIN_PATH@ server -config @UDP_CUSTOM_DIR@/config.json
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

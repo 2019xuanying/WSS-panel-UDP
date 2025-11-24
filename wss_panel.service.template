@@ -1,0 +1,23 @@
+[Unit]
+Description=WSS User Management Panel (Control Plane)
+After=network.target
+
+[Service]
+Type=simple
+
+# [AXIOM V2.0] 移除所有硬编码的端口/密钥环境变量。
+# 服务将从 /etc/wss-panel/config.json 读取配置。
+# 保留 PANEL_DIR_ENV 是为了帮助进程找到 config.json。
+Environment=PANEL_DIR_ENV=@PANEL_DIR@
+Environment=NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules:@PANEL_DIR@/node_modules
+
+WorkingDirectory=@PANEL_DIR@
+ExecStart=/usr/bin/node @PANEL_DIR@/@PANEL_BACKEND_SCRIPT_PATH@
+
+Restart=on-failure
+# [AXIOM V1.7.0] 最小权限: 不再使用 root
+User=@PANEL_USER@
+Group=@PANEL_USER@
+
+[Install]
+WantedBy=multi-user.target

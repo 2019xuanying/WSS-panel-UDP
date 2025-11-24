@@ -1,0 +1,19 @@
+{
+  "name": "wss-panel-node",
+  "version": "9.0.0",
+  "description": "WSS Tunnel User Management Panel (Axiom V5.0)",
+  "main": "wss_panel.js",
+  "scripts": {
+    "start": "node wss_panel.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "express-rate-limit": "^7.3.1",
+    "ws": "^8.17.1"
+  }
+}

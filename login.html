@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 登录</title>
+    <!-- 引入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 引入 Inter 字体 */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            /* 确保渐变始终覆盖全屏 */
+            min-height: 100vh;
+            background: linear-gradient(135deg, #4f46e5 0%, #1e3a8a 100%); /* 渐变蓝 */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 1rem; /* 16px */
+            box-sizing: border-box;
+        }
+        .login-card {
+            background: white;
+            padding: 2.5rem; /* 40px */
+            border-radius: 1.5rem; /* 24px - rounded-2xl */
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04); /* shadow-xl */
+            width: 100%;
+            max-width: 28rem; /* 448px - max-w-md */
+            animation: fadeInDown 0.5s ease-out;
+            box-sizing: border-box;
+        }
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .input-style {
+            transition: all 0.2s ease-in-out;
+            /* 确保输入框有内边距 */
+            padding: 0.75rem 1rem; /* p-3 */
+            width: 100%;
+            border: 1px solid #D1D5DB; /* border-gray-300 */
+            border-radius: 0.75rem; /* rounded-xl */
+            box-sizing: border-box;
+        }
+        .input-style:focus {
+            border-color: #4f46e5; /* focus:border-indigo-600 */
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.3); /* 蓝色光晕 */
+            outline: none;
+        }
+        .submit-button {
+            width: 100%;
+            background-color: #4f46e5; /* bg-indigo-600 */
+            color: white;
+            font-weight: 700;
+            padding: 0.75rem; /* py-3 */
+            border-radius: 0.75rem; /* rounded-xl */
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.06); /* shadow-lg shadow-indigo-500/50 */
+        }
+        .submit-button:hover {
+            background-color: #4338ca; /* hover:bg-indigo-700 */
+            transform: translateY(-2px); /* hover:scale-[1.01] */
+        }
+        .submit-button:active {
+            transform: translateY(0); /* active:scale-[0.99] */
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <!-- 头部图标和标题 -->
+        <div class="text-center mb-8">
+            <!-- 锁形图标 (Lucide Icon Placeholder) -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mx-auto mb-3">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <h1 class="text-3xl font-bold text-gray-800 tracking-tight">WSS 管理面板</h1>
+            <p class="text-gray-500 mt-1">请使用管理员权限登录</p>
+        </div>
+
+        <!-- [AXIOM V2.0] 错误信息容器。将由下面的内联脚本填充 -->
+        <div id="error-container" class="mb-4">
+            <!-- {{ error }} 占位符已被移除 -->
+        </div>
+
+        <form method="POST" action="/login" class="space-y-6">
+            <div>
+                <label for="username" class="block text-sm font-semibold text-gray-700 mb-1.5">用户名</label>
+                <!-- [AXIOM V2.0] 移除 {{ ROOT_USERNAME }} 占位符 -->
+                <input type="text" id="username" placeholder="输入用户名" name="username" value="root" required
+                       class="input-style"
+                       autocomplete="off" autocapitalize="off" aria-label="用户名">
+            </div>
+
+            <div>
+                <label for="password" class="block text-sm font-semibold text-gray-700 mb-1.5">密码</label>
+                <input type="password" id="password" placeholder="输入密码" name="password" required autofocus
+                       class="input-style" aria-label="密码">
+            </div>
+            
+            <button type="submit" class="submit-button">
+                立即登录
+            </button>
+        </form>
+
+        <p class="text-center text-xs text-gray-400 mt-8">
+            WSS Panel (Axiom V2.0)
+        </p>
+    </div>
+    
+    <!-- [AXIOM V2.0] 新增: 客户端 JS，用于显示错误消息 -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            try {
+                const params = new URLSearchParams(window.location.search);
+                const error = params.get('error');
+                if (error) {
+                    const errorContainer = document.getElementById('error-container');
+                    // 解码 URL 编码的错误消息 (例如 "用户名或密码错误。")
+                    const decodedError = decodeURIComponent(error);
+                    errorContainer.innerHTML = `
+                        <div class="error bg-red-100 text-red-700 p-3 rounded-lg border border-red-300 mb-6 font-medium text-center">
+                            ${decodedError}
+                        </div>
+                    `;
+                }
+            } catch (e) {
+                console.error("Error displaying login error:", e);
+            }
+        });
+    </script>
+</body>
+</html>

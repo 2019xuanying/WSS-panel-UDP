@@ -1,0 +1,13 @@
+{
+  "panel_user": "admin",
+  "panel_port": 54321,
+  "wss_http_port": 80,
+  "wss_tls_port": 443,
+  "stunnel_port": 444,
+  "udpgw_port": 7300,
+  "internal_forward_port": 22,
+  "internal_api_port": 54322,
+  "internal_api_secret": "default-secret-key-please-change",
+  "panel_api_url": "http://127.0.0.1:54321/internal",
+  "proxy_api_url": "http://127.0.0.1:54322"
+}
