@@ -11,7 +11,7 @@
 
 set -eu
 
-REPO_URL="https://github.com/2019xuanying/WSS-panel.git"
+REPO_URL="https://github.com/2019xuanying/WSS-panel-UDP.git"
 TEMP_DIR="/tmp/wss_deploy_$(date +%s)"
 
 echo "==== WSS 一键部署引导程序 V2.1 ===="
