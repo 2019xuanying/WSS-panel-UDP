@@ -5,6 +5,7 @@
  * - [UI NEW] 更新 CORE_SERVICES_MAP，加入 'wss-udp-custom' (HTTP Custom UDP Tunnel)。
  * - [UI NEW] 在端口配置逻辑中增加 UDP Custom 端口的处理 (fetch/save)。
  * - 增强了对新服务状态的显示支持。
+ * * [AXIOM V6.0 FIX] 修复了新增用户表单中 quota_gb 和 require_auth_header 的 ReferenceError。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -1410,7 +1411,7 @@ async function fetchAllStaticData() {
                 WSS_TLS_PORT: data.config.wss_tls_port,
                 STUNNEL_PORT: data.config.stunnel_port,
                 UDPGW_PORT: data.config.udpgw_port,
-                UDP_CUSTOM_PORT: data.config.udp_custom_port, // [V5.7]
+                UDP_CUSTOM_PORT: data.config.udp_custom_port,
                 INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
                 PANEL_PORT: data.config.panel_port
             };
@@ -1516,7 +1517,7 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
     const username = document.getElementById('new-username').value;
     const password = document.getElementById('new-password').value;
     const expirationDays = document.getElementById('expiration-days').value;
-    const quotaGb = document.getElementById('quota-gb').value;
+    const quotaGb = document.getElementById('quota-gb').value; // Corrected: quotaGb
     const rateKbps = document.getElementById('rate-kbps').value;
     const maxConnections = document.getElementById('new-max-connections').value;
     const requireAuth = document.getElementById('new-require-auth').checked; 
@@ -1528,6 +1529,7 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
     }
     showStatus('正在创建用户 ' + username + '...', true);
 
+    // [AXIOM V6.0 FIX]: 修复变量引用错误 (quota_gb -> quotaGb, require_auth_header -> requireAuth)
     const result = await fetchData('/users/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1535,10 +1537,10 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
             username: username, 
             password: password, 
             expiration_days: parseInt(expirationDays),
-            quota_gb: parseFloat(quota_gb), 
-            rate_kbps: parseInt(rate_kbps),
-            max_connections: parseInt(max_connections),
-            require_auth_header: require_auth_header ? 1 : 0,
+            quota_gb: parseFloat(quotaGb), 
+            rate_kbps: parseInt(rateKbps),
+            max_connections: parseInt(maxConnections),
+            require_auth_header: requireAuth ? 1 : 0, // Corrected: requireAuth
             allow_shell: allowShell ? 1 : 0 
         })
     });
