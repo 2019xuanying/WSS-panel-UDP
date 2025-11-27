@@ -1,12 +1,11 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.3.0 (Axiom Refactor V6.0 - Compact IPC Adapter & Zombie TTL Fix)
+ * V9.7.0 (Axiom Refactor V6.0 - Global IP Fix)
  *
- * [AXIOM V6.0 CHANGELOG]
- * - [PERFORMANCE] 适配新的 'stats_update_compact' IPC 协议 (接收紧凑数组)。
- * - [BUGFIX/STABILITY] 实施 workerStatsCache TTL (Time-To-Live) 机制，每 3 秒运行一次。
- * - 僵尸连接修复: 强制将超过 3 秒未更新的 Worker 数据置为离线状态，彻底解决僵尸连接问题。
- * - 优化 aggregateAllWorkerStats 逻辑，提升实时数据处理效率。
+ * [AXIOM V9.7 CHANGELOG]
+ * - [BUGFIX] 修复 /api/system/active_ips 接口无法返回实时 IP 列表的问题。
+ * - [REFACTOR] 重构 IPC 连接元数据获取机制，统一使用 fetchLiveConnections(username = null) 函数进行单用户或全局 IP 聚合。
+ * - [PERFORMANCE] 确保 IPC handler 中对 fetchLiveConnections 的回调处理正确，以支持全局实时 IP 列表的异步聚合。
  */
 
 // --- 核心依赖 ---
@@ -654,7 +653,7 @@ function pushLiveUpdates() {
             usersToPush[username] = current;
             usersChanged = true;
         }
-        // [AXIOM V5.5 FIX] 如果用户没有连接，且速度为0，从推送中移除，让前端使用DB数据
+        // [AXIOM V5.5 FIX] 如果用户没有连接，且速度为0，从推送中移除，让前端使用 DB 数据
         if (current.connections === 0 && current.speed_kbps.upload < 0.1 && current.speed_kbps.download < 0.1) {
              delete usersToPush[username];
              // [V6.0 FIX] 如果上次推送是活跃的，但现在归零了，需要显式更新缓存
@@ -1078,9 +1077,10 @@ app.use('/internal', internalApi);
 const api = express.Router();
 
 /**
- * [AXIOM V5.2] 新增：跨 Worker 获取用户实时连接元数据
+ * [AXIOM V9.7 REFACTOR] 跨 Worker 获取实时连接元数据 (单用户或全局)
+ * @param {string | null} username - 如果为 null，则获取所有用户的连接
  */
-async function getLiveConnectionMetadata(username) {
+async function fetchLiveConnections(username = null) {
     if (!wssIpc || wssIpc.clients.size === 0) {
         return { success: false, connections: [], message: 'Proxy workers are disconnected.' };
     }
@@ -1090,9 +1090,11 @@ async function getLiveConnectionMetadata(username) {
     workerMetadataResponses.clear();
     
     // 1. 广播请求到所有 Worker
+    // 新增 GET_ALL_METADATA action 以获取所有用户的连接
+    const actionType = username ? 'GET_METADATA' : 'GET_ALL_METADATA'; 
     const requestMessage = JSON.stringify({
-        action: 'GET_METADATA',
-        username: username,
+        action: actionType,
+        username: username, // null for global
         requestId: requestId
     });
     
@@ -1105,7 +1107,7 @@ async function getLiveConnectionMetadata(username) {
     // 2. 等待 Worker 响应 (设置超时 3000ms)
     return new Promise((resolve) => {
         const timer = setTimeout(() => {
-            console.warn(`[METADATA] Timeout waiting for worker responses. Received ${workerMetadataResponses.size}/${workersToWait} responses.`);
+            console.warn(`[METADATA:${actionType}] Timeout waiting for worker responses. Received ${workerMetadataResponses.size}/${workersToWait} responses.`);
             resolve(aggregateResponses());
         }, 3000);
 
@@ -1135,7 +1137,7 @@ async function getLiveConnectionMetadata(username) {
         }
         
         // 临时存储响应的函数 (被 IPC 消息处理器调用)
-        getLiveConnectionMetadata.onResponse = (response) => {
+        fetchLiveConnections.onResponse = (response) => {
             if (response.requestId === requestId) {
                 workerMetadataResponses.set(response.workerId, response);
                 checkResponses();
@@ -1145,7 +1147,7 @@ async function getLiveConnectionMetadata(username) {
         // 清理函数 (确保在 Promise 结束后移除临时回调)
         const originalResolve = resolve;
         resolve = (value) => {
-            delete getLiveConnectionMetadata.onResponse;
+            delete fetchLiveConnections.onResponse;
             originalResolve(value);
         };
     });
@@ -1153,7 +1155,7 @@ async function getLiveConnectionMetadata(username) {
 
 
 /**
- * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据
+ * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据 (单用户)
  */
 api.get('/users/connections', async (req, res) => {
     const { username } = req.query;
@@ -1162,7 +1164,7 @@ api.get('/users/connections', async (req, res) => {
     }
     
     try {
-        const result = await getLiveConnectionMetadata(username);
+        const result = await fetchLiveConnections(username);
         if (result.success) {
             return res.json({ success: true, connections: result.connections, message: result.message });
         } else {
@@ -1293,35 +1295,35 @@ api.get('/system/audit_logs', async (req, res) => {
 
 api.get('/system/active_ips', async (req, res) => {
     try {
-        // [V9.1 FIX] 实时 IP 列表改为按需聚合所有 Worker 的当前 IP Map
-        const allLiveIps = new Map();
-        
-        for (const [workerId, workerData] of workerStatsCache.entries()) {
-             // WorkerData 的 stats 结构现在是 { username: {...} }，我们无法从这里直接得到 IP
-             // 而是需要使用新的 GET_METADATA 机制来拉取详细 IP 列表
-             // 为了避免重写前端，我们暂时依赖 GET_METADATA 接口 (需要用户在 UI 上点击详情)
-             // 这里的 /system/active_ips 只能返回一个大致的连接数，无法返回 IP 列表
-             
-             // 临时回退：如果 workerStatsCache 中仍然存在旧的 live_ips 结构 (例如来自其他 Worker/服务)，则尝试聚合
-             if (workerData.live_ips) {
-                 for(const ip in workerData.live_ips) {
-                    allLiveIps.set(ip, workerData.live_ips[ip]);
-                 }
-             }
+        // [V9.7 FIX] 使用 IPC 机制实时聚合所有 Worker 的连接 IP 列表
+        const result = await fetchLiveConnections(null); // <-- Fetch all connections
+
+        if (!result.success) {
+            return res.status(503).json({ success: false, message: result.message });
         }
         
-        // 由于 wss_proxy.js V9.1 已移除 live_ips 的推送，此处的 allLiveIps 将为空。
-        // 正确的实现是让前端使用 /users/connections?username=<user> 来获取 IP。
-        // 为了兼容旧版 UI，我们仍然返回一个空列表或依赖上面不完整的聚合。
+        // 1. 从聚合的连接列表中提取 IP 和用户名
+        const ipMap = new Map(); // key: ip, value: username
+        // connections 数组中的每个元素现在是 { id, ip, start, workerId, username }
+        result.connections.forEach(conn => {
+            // 使用 Map 确保 IP 唯一，并记录其关联的用户名
+            ipMap.set(conn.ip, conn.username || 'N/A');
+        });
         
+        // 2. 检查每个 IP 的封禁状态
         const ipList = await Promise.all(
-            Array.from(allLiveIps.keys()).map(async ip => {
+            Array.from(ipMap.keys()).map(async ip => {
                 const isBanned = (await manageIpIptables(ip, 'check')).success;
-                return { ip: ip, is_banned: isBanned, username: allLiveIps.get(ip) };
+                // [V9.7 FIX] 返回 IP 对应的 username
+                return { ip: ip, is_banned: isBanned, username: ipMap.get(ip) }; 
             })
         );
+        
+        // 由于前端 UI 的 live-ips 视图需要这些数据，我们直接返回
         res.json({ success: true, active_ips: ipList });
+        
     } catch (e) {
+        console.error(`[API] Failed to get active IPs: ${e.message}`);
         res.status(500).json({ success: false, message: e.message });
     }
 });
@@ -1493,7 +1495,7 @@ api.post('/users/set_settings', async (req, res) => {
                 await safeRunCommand(['pkill', '-9', '-u', username]);
             }
             const { success: groupSuccess, output: groupOutput } = await safeRunCommand(groupCmd);
-            if (!groupSuccess) {
+            if (!success) {
                 if (!groupOutput.includes("is not a member")) {
                     throw new Error(`Failed to update group membership: ${groupOutput}`);
                 }
@@ -2128,8 +2130,9 @@ function startWebSocketServers(httpServer) {
                 } 
                 // [AXIOM V5.2] 处理 Worker 的元数据响应
                 else if (message.type === 'METADATA_RESPONSE') {
-                     if (typeof getLiveConnectionMetadata.onResponse === 'function') {
-                         getLiveConnectionMetadata.onResponse(message);
+                     // [V9.7 FIX] 检查新的 fetchLiveConnections 上的临时回调
+                     if (typeof fetchLiveConnections.onResponse === 'function') {
+                         fetchLiveConnections.onResponse(message);
                      }
                 }
                 
