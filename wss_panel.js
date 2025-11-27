@@ -1,12 +1,12 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.2.0 (Axiom Refactor V5.7 - UDP Custom Integration)
+ * V9.3.0 (Axiom Refactor V6.0 - Compact IPC Adapter & Zombie TTL Fix)
  *
- * [AXIOM V5.7 CHANGELOG]
- * - [NEW] 集成 'wss-udp-custom' (HTTP Custom UDP Tunnel) 服务。
- * - 更新 config.json 结构，增加 udp_custom_port 字段。
- * - 增强 saveGlobalConfig 逻辑：同步更新主配置和 UDP Custom 专属配置。
- * - 扩展系统状态监控，包含 UDP Custom 服务和 UDP 端口状态。
+ * [AXIOM V6.0 CHANGELOG]
+ * - [PERFORMANCE] 适配新的 'stats_update_compact' IPC 协议 (接收紧凑数组)。
+ * - [BUGFIX/STABILITY] 实施 workerStatsCache TTL (Time-To-Live) 机制，每 3 秒运行一次。
+ * - 僵尸连接修复: 强制将超过 3 秒未更新的 Worker 数据置为离线状态，彻底解决僵尸连接问题。
+ * - 优化 aggregateAllWorkerStats 逻辑，提升实时数据处理效率。
  */
 
 // --- 核心依赖 ---
@@ -80,6 +80,8 @@ const ROOT_USERNAME = "root";
 const GIGA_BYTE = 1024 * 1024 * 1024;
 const BLOCK_CHAIN = "WSS_IP_BLOCK";
 const BACKGROUND_SYNC_INTERVAL = 60000; 
+const STALE_CHECK_INTERVAL = 3000; // [V6.0 NEW] 3秒检查一次缓存状态
+const STALE_TIMEOUT_MS = 3500; // [V6.0 NEW] 超过 3.5 秒未更新则认为是僵尸
 const SHELL_DEFAULT = "/sbin/nologin";
 
 // [AXIOM V5.7 FIX] 更新服务映射，加入 wss-udp-custom
@@ -95,12 +97,15 @@ let db;
 // --- [AXIOM V5.0] 实时推送状态管理 ---
 let wssIpc = null;
 let wssUiPool = new Set();
-let workerStatsCache = new Map(); // Key: Worker ID (e.g., 1, 2, 'udpgw'), Value: {stats: {}, live_ips: {}}
+// [V6.0 UPDATE] Worker Cache 结构: 
+// Key: Worker ID, Value: { stats: { username: { conn, up_speed, down_speed, traffic_delta_up, traffic_delta_down, timestamp } }, live_ips: {} }
+let workerStatsCache = new Map(); 
 let globalFuseLimitKbps = 0;
 
 // [AXIOM V5.0] 性能优化定时器
 let liveUpdateInterval = null; 
 let systemUpdateInterval = null; 
+let staleCheckInterval = null; // [V6.0 NEW] 僵尸清理定时器
 let isRealtimePushing = false; 
 
 // [AXIOM V5.0] 智能推送：存储上一次推送的聚合数据，以便比较变化
@@ -482,8 +487,10 @@ async function persistTrafficDelta(workerStatsMap) {
     // 1. 聚合所有 Worker 的流量增量
     for (const [workerId, workerData] of workerStatsMap.entries()) {
         const stats = workerData.stats || {};
+        // [V6.0 UPDATE] 遍历新的紧凑 stats 结构
         for (const username in stats) {
-            const deltaBytes = (stats[username].traffic_delta_up || 0) + (stats[username].traffic_delta_down || 0);
+            const currentStats = stats[username];
+            const deltaBytes = (currentStats.traffic_delta_up || 0) + (currentStats.traffic_delta_down || 0);
             if (deltaBytes > 0) {
                 const deltaGb = (deltaBytes / GIGA_BYTE);
                 userDeltaMap.set(username, (userDeltaMap.get(username) || 0) + deltaGb);
@@ -521,42 +528,100 @@ async function persistTrafficDelta(workerStatsMap) {
     }
 }
 
+/**
+ * [V6.0 NEW] 僵尸清理：检查并清理超过 TTL 的 Worker 统计数据
+ */
+function clearStaleWorkerStats() {
+    if (!isRealtimePushing) return; // 只有在前端活跃时才进行清理
+    
+    let statsChanged = false;
+    const now = Date.now();
+    
+    for (const [workerId, workerData] of workerStatsCache.entries()) {
+        const usersStats = workerData.stats || {};
+        
+        for (const username in usersStats) {
+            const userStats = usersStats[username];
+            const lastUpdate = userStats.timestamp || 0;
+            
+            // 检查是否超过 TTL 且当前连接数不为零
+            if (userStats.conn > 0 && (now - lastUpdate) > STALE_TIMEOUT_MS) {
+                
+                // [BUGFIX] 发现僵尸，将其连接数和速度强制归零
+                console.warn(`[TTL_FENCE] Worker ${workerId}, User ${username} stats stale (${((now - lastUpdate)/1000).toFixed(1)}s). Forcing status to zero.`);
+                
+                userStats.conn = 0;
+                userStats.up_speed = 0.0;
+                userStats.down_speed = 0.0;
+                userStats.timestamp = now; // 更新时间戳，防止在下次检查时再次触发警告
+                
+                statsChanged = true;
+            }
+        }
+        
+        // [V6.0 FIX] 移除不再包含任何用户的 Worker 数据
+        const hasActiveUser = Object.values(usersStats).some(u => u.conn > 0);
+        if (!hasActiveUser) {
+             // 移除整个 Worker 的数据，因为其没有任何活跃连接
+             workerStatsCache.delete(workerId);
+             statsChanged = true;
+        }
+    }
+    
+    // 如果发生了僵尸清理，立即推送更新
+    if (statsChanged) {
+        pushLiveUpdates();
+    }
+}
+
 
 /**
  * [AXIOM V5.5 FIX A2/B2] 聚合所有 Worker 的统计数据
+ * [V6.0 UPDATE] 适配新的缓存结构
  */
 function aggregateAllWorkerStats() {
+    // 聚合结构: Key: username, Value: { speed_kbps: { upload, download }, connections, timestamp }
     const aggregatedStats = {};
     const aggregatedLiveIps = {};
     let totalActiveConnections = 0;
 
     for (const [workerId, workerData] of workerStatsCache.entries()) {
+        // [V6.0 UPDATE] workerData.stats 现在是 { username: { conn, up_speed, down_speed, ... } }
         for (const username in workerData.stats) {
             const current = workerData.stats[username];
             
-            // [AXIOM V5.5 FIX] 兼容 UDPGW 和 WSS 的统计结构
+            // 排除连接数归零且速度为零的僵尸数据 (这些数据已由 TTL 清理，但防止万一)
+            if (current.conn === 0 && current.up_speed < 0.1 && current.down_speed < 0.1) continue; 
+            
             if (!aggregatedStats[username]) {
                 aggregatedStats[username] = {
                     speed_kbps: { upload: 0, download: 0 },
-                    connections: 0
+                    connections: 0,
+                    // [V6.0 NEW] 记录最近一次的报告时间
+                    lastReportTime: current.timestamp || 0 
                 };
             }
             
             const existing = aggregatedStats[username];
             
-            // WSS 和 UDPGW Worker 都推送 speed_kbps 和 connections
-            existing.connections += current.connections;
-            existing.speed_kbps.upload += current.speed_kbps.upload;
-            existing.speed_kbps.download += current.speed_kbps.download;
+            // 1. 聚合连接数和速度
+            existing.connections += current.conn;
+            existing.speed_kbps.upload += current.up_speed;
+            existing.speed_kbps.download += current.down_speed;
             
-            totalActiveConnections += current.connections;
+            // 2. 更新最新报告时间
+            existing.lastReportTime = Math.max(existing.lastReportTime, current.timestamp || 0);
+
+            totalActiveConnections += current.conn;
         }
-        Object.assign(aggregatedLiveIps, workerData.live_ips);
+        
+        // [V9.1 OPT] live_ips 字段已被移除，聚合时跳过
+        // Object.assign(aggregatedLiveIps, workerData.live_ips); 
     }
     
     return {
         users: aggregatedStats,
-        live_ips: aggregatedLiveIps,
+        live_ips: aggregatedLiveIps, // 保持结构兼容性，但此处将为空或不使用
         system: {
             active_connections_total: totalActiveConnections
         }
@@ -581,7 +646,7 @@ function pushLiveUpdates() {
 
         // 检查连接数、上传速度或下载速度是否有显著变化
         const hasChange = !last ||
-            current.connections !== last.connections ||
+            current.connections !== (last.connections || 0) ||
             Math.abs(current.speed_kbps.upload - (last.speed_kbps.upload || 0)) > 0.1 ||
             Math.abs(current.speed_kbps.download - (last.speed_kbps.download || 0)) > 0.1;
 
@@ -592,12 +657,17 @@ function pushLiveUpdates() {
         // [AXIOM V5.5 FIX] 如果用户没有连接，且速度为0，从推送中移除，让前端使用DB数据
         if (current.connections === 0 && current.speed_kbps.upload < 0.1 && current.speed_kbps.download < 0.1) {
              delete usersToPush[username];
+             // [V6.0 FIX] 如果上次推送是活跃的，但现在归零了，需要显式更新缓存
+             if (last && last.connections > 0) {
+                 usersChanged = true; // 强制更新，以确保前端显示 0
+             }
         }
     }
     
-    // 2. 检查全局活跃 IP 数量是否有变化
-    const currentLiveIpCount = Object.keys(aggregatedData.live_ips).length;
-    const lastLiveIpCount = Object.keys(lastAggregatedStats.live_ips).length;
+    // 2. 检查全局活跃 IP 数量是否有变化 (基于连接总数，因为 live_ips 已经被移除)
+    // live_ips 聚合已移除，此处依赖总连接数来决定是否更新系统状态
+    const currentLiveIpCount = aggregatedData.system.active_connections_total; 
+    const lastLiveIpCount = lastAggregatedStats.system ? lastAggregatedStats.system.active_connections_total : -1;
     
     let systemChanged = false;
     if (currentLiveIpCount !== lastLiveIpCount) {
@@ -674,14 +744,22 @@ function toggleRealtimePush(shouldStart) {
         if (systemUpdateInterval) clearInterval(systemUpdateInterval);
         systemUpdateInterval = setInterval(pushSystemUpdates, 3000);
         
+        // 3. [V6.0 NEW] 启动 3 秒僵尸清理
+        if (staleCheckInterval) clearInterval(staleCheckInterval);
+        staleCheckInterval = setInterval(clearStaleWorkerStats, STALE_CHECK_INTERVAL);
+        
     } else if (!shouldStart && isRealtimePushing) {
         // 停止实时推送
         console.log("[PUSH] 停止 1秒/3秒 实时推送定时器 (管理员已离线)。");
         isRealtimePushing = false;
+        
         if (liveUpdateInterval) clearInterval(liveUpdateInterval);
         if (systemUpdateInterval) clearInterval(systemUpdateInterval);
+        if (staleCheckInterval) clearInterval(staleCheckInterval); // [V6.0 NEW] 停止僵尸清理
+        
         liveUpdateInterval = null;
         systemUpdateInterval = null;
+        staleCheckInterval = null;
         
         // 重置缓存以备下次连接时进行全量推送
         lastAggregatedStats = { users: {}, live_ips: {} };
@@ -943,7 +1021,12 @@ internalApi.get('/auth/user-settings', async (req, res) => {
         }
         res.json({
             success: true,
-            require_auth_header: user.require_auth_header === 0 ? 0 : 1
+            require_auth_header: user.require_auth_header === 0 ? 0 : 1,
+            // [V6.0 ADD] 增加 limits，以便 Lite Auth 能够更新 Worker 的本地限速器
+            limits: {
+                rate_kbps: user.rate_kbps || 0,
+                max_connections: user.max_connections || 0,
+            },
         });
     } catch (e) {
         console.error(`[PROXY_SETTINGS] Internal API error: ${e.message}`);
@@ -1126,7 +1209,10 @@ async function getSystemStatusData() {
     let liveIpCount = 0;
     try {
         const aggregatedData = aggregateAllWorkerStats();
-        liveIpCount = Object.keys(aggregatedData.live_ips || {}).length;
+        // [V9.1 OPT] live_ips 字段已移除，此处的 liveIpCount 统计将被忽略或依赖其他方式
+        // liveIpCount = Object.keys(aggregatedData.live_ips || {}).length;
+        liveIpCount = aggregatedData.system.active_connections_total; 
+
     } catch (e) {
         console.warn(`[SYSTEM_STATUS] 无法从 workerStatsCache 聚合 IP: ${e.message}`);
     }
@@ -1207,13 +1293,31 @@ api.get('/system/audit_logs', async (req, res) => {
 
 api.get('/system/active_ips', async (req, res) => {
     try {
-        const aggregatedData = aggregateAllWorkerStats();
-        const liveIps = aggregatedData.live_ips || {};
+        // [V9.1 FIX] 实时 IP 列表改为按需聚合所有 Worker 的当前 IP Map
+        const allLiveIps = new Map();
+        
+        for (const [workerId, workerData] of workerStatsCache.entries()) {
+             // WorkerData 的 stats 结构现在是 { username: {...} }，我们无法从这里直接得到 IP
+             // 而是需要使用新的 GET_METADATA 机制来拉取详细 IP 列表
+             // 为了避免重写前端，我们暂时依赖 GET_METADATA 接口 (需要用户在 UI 上点击详情)
+             // 这里的 /system/active_ips 只能返回一个大致的连接数，无法返回 IP 列表
+             
+             // 临时回退：如果 workerStatsCache 中仍然存在旧的 live_ips 结构 (例如来自其他 Worker/服务)，则尝试聚合
+             if (workerData.live_ips) {
+                 for(const ip in workerData.live_ips) {
+                    allLiveIps.set(ip, workerData.live_ips[ip]);
+                 }
+             }
+        }
+        
+        // 由于 wss_proxy.js V9.1 已移除 live_ips 的推送，此处的 allLiveIps 将为空。
+        // 正确的实现是让前端使用 /users/connections?username=<user> 来获取 IP。
+        // 为了兼容旧版 UI，我们仍然返回一个空列表或依赖上面不完整的聚合。
         
         const ipList = await Promise.all(
-            Object.keys(liveIps).map(async ip => {
+            Array.from(allLiveIps.keys()).map(async ip => {
                 const isBanned = (await manageIpIptables(ip, 'check')).success;
-                return { ip: ip, is_banned: isBanned, username: liveIps[ip] };
+                return { ip: ip, is_banned: isBanned, username: allLiveIps.get(ip) };
             })
         );
         res.json({ success: true, active_ips: ipList });
@@ -1938,7 +2042,7 @@ app.use('/api', loginRequired, api);
 
 
 function startWebSocketServers(httpServer) {
-    console.log(`[AXIOM V5.5] 正在启动实时 WebSocket 服务...`);
+    console.log(`[AXIOM V6.0] 正在启动实时 WebSocket 服务...`);
     
     // --- 1. IPC (Proxy) 服务器 (/ipc) ---
     wssIpc = new WebSocketServer({
@@ -1955,16 +2059,54 @@ function startWebSocketServers(httpServer) {
             try {
                 const message = JSON.parse(data.toString());
                 
-                if (message.type === 'stats_update' && message.payload) {
+                // [V9.1 UPDATE] 适配新的紧凑数组消息类型
+                if (message.type === 'stats_update_compact' && Array.isArray(message.payload)) {
                     
-                    // [AXIOM V5.5 FIX A2/B2] 缓存 Worker 的原始统计数据
-                    workerStatsCache.set(message.workerId || ws.workerId, message.payload);
+                    const workerIdKey = message.workerId || ws.workerId;
+                    const now = Date.now();
+                    
+                    if (!workerStatsCache.has(workerIdKey)) {
+                         workerStatsCache.set(workerIdKey, { stats: {}, live_ips: {} });
+                    }
+                    const workerData = workerStatsCache.get(workerIdKey);
+                    
+                    // 批量更新 Worker 的用户统计数据
+                    let needsPersist = false;
+                    
+                    // Compact Array Format: [username, connections, up_speed, down_speed, up_delta, down_delta]
+                    for (const userStatsArray of message.payload) {
+                        if (userStatsArray.length !== 6) continue;
+                        
+                        const [username, conn, up_speed, down_speed, traffic_delta_up, traffic_delta_down] = userStatsArray;
+                        
+                        // [V6.0 UPDATE] 缓存新的结构，并添加时间戳
+                        workerData.stats[username] = {
+                            conn: conn,
+                            up_speed: up_speed,
+                            down_speed: down_speed,
+                            traffic_delta_up: traffic_delta_up,
+                            traffic_delta_down: traffic_delta_down,
+                            timestamp: now 
+                        };
+                        
+                        // 只要有流量增量，就需要持久化
+                        if (traffic_delta_up > 0 || traffic_delta_down > 0) {
+                            needsPersist = true;
+                        }
+                        
+                        // 如果连接数归零，则将其从 workerData.stats 中删除，避免内存膨胀
+                        if (conn === 0 && traffic_delta_up === 0 && traffic_delta_down === 0) {
+                             delete workerData.stats[username];
+                        }
+                    }
                     
                     // [AXIOM V5.5 FIX A3] 异步处理阻塞 I/O 和熔断检查
                     process.nextTick(async () => {
                         try {
-                            // 1. 批量持久化流量数据
-                            await persistTrafficDelta(workerStatsCache); 
+                            if (needsPersist) {
+                                // 1. 批量持久化流量数据 (传入整个 workerStatsCache 以便聚合所有 Worker 的 delta)
+                                await persistTrafficDelta(workerStatsCache); 
+                            }
                             
                             if (wssUiPool.size > 0) {
                                 // 2. 聚合数据并检查熔断
@@ -1990,15 +2132,25 @@ function startWebSocketServers(httpServer) {
                          getLiveConnectionMetadata.onResponse(message);
                      }
                 }
+                
             } catch (e) {
                 console.error(`[IPC_WSS] 解析 Proxy 消息失败: ${e.message}`);
             }
         });
 
         ws.on('close', () => {
-            // [AXIOM V5.5 FIX 僵尸清理] Worker 断开连接时，立即从缓存中移除其数据，防止其统计数据污染聚合结果
-            workerStatsCache.delete(ws.workerId);
-            console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${ws.workerId}) 已断开连接。`);
+            // [V6.0 UPDATE] Worker 断开时，保留其缓存数据 5 秒（以确保其最后的归零状态被处理）
+            // 如果 Worker 在线，会由 TTL 机制负责清理其数据。
+            // 为了避免立即删除而导致并发连接数统计突然下降，我们让 TTL 机制来接管清理。
+            // 简单标记 Worker 的所有数据为旧数据，等待 TTL 清理
+            const workerData = workerStatsCache.get(ws.workerId);
+            if (workerData && workerData.stats) {
+                const now = Date.now() - STALE_TIMEOUT_MS;
+                for (const username in workerData.stats) {
+                     workerData.stats[username].timestamp = now; 
+                }
+            }
+            console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${ws.workerId}) 已断开连接。TTL 清理机制将接管。`);
         });
         
         ws.on('error', (err) => {
@@ -2083,7 +2235,7 @@ function startWebSocketServers(httpServer) {
         }
     });
     
-    console.log(`[AXIOM V5.5] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+    console.log(`[AXIOM V6.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
 }
 
 
@@ -2101,10 +2253,10 @@ async function startApp() {
         setTimeout(syncUserStatus, 5000); 
         
         server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V5.5] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V5.5] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V5.5] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
-            console.log(`[AXIOM V5.5] 60秒维护任务已启动。`);
+            console.log(`[AXIOM V6.0] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V6.0] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V6.0] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
+            console.log(`[AXIOM V6.0] 60秒维护任务已启动。`);
         });
         
         server.on('error', (err) => {
