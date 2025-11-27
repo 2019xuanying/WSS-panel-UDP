@@ -1,12 +1,11 @@
 /**
  * WSS Proxy Core (Node.js)
- * V9.6.0 (Axiom Stealth - Smart Dual-Mode)
+ * V9.7.0 (Axiom Stealth - Global IP Fix)
  *
- * [ARCHITECT REVIEW V9.6.0]
+ * [ARCHITECT REVIEW V9.7.0]
+ * - [BUGFIX] 增强 IPC 消息处理，以支持控制平面发起的全局实时 IP 列表查询 (GET_ALL_METADATA)。
+ * - 确保在响应中包含连接的 username 和 clientIp，用于面板上的实时连接 IP 列表功能。
  * - [STEALTH] 真实网站回落 (Real-Site Fallback): 非法流量（Host不匹配/协议错误）会被透明代理到 FALLBACK_TARGET (如 www.bing.com)。
- * 探测者将看到真实的 Bing 响应，而不是静态页面。
- * - [COMPATIBILITY] 宽松的 Payload Eater: 在 WebSocket 握手后，优先尝试寻找 SSH-2.0- 标记并清洗数据。
- * 如果找不到标记但有数据（针对非标准客户端），则回退到“原样转发”模式，确保连接不中断。
  * - [PERFORMANCE] 集成了 V9.x 的 IPC 性能优化（紧凑数组推送、僵尸连接修复）。
  */
 
@@ -32,7 +31,7 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            console.log(`[AXIOM V9.6] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
+            console.log(`[AXIOM V9.7] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
         }
     } catch (e) {
         console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。服务将退出。`);
@@ -117,7 +116,8 @@ class TokenBucket {
 }
 
 // --- 全局状态管理 ---
-const userStats = new Map();
+// userStats 结构: Map<username, { connections: Map<net.Socket, {id, clientIp, startTime, username}>, ... }>
+const userStats = new Map(); 
 const SPEED_CALC_INTERVAL = 1000; 
 
 const pending_traffic_delta = {}; 
@@ -126,7 +126,7 @@ const WORKER_ID = cluster.isWorker ? cluster.worker.id : 'master';
 function getUserStat(username) {
     if (!userStats.has(username)) {
         userStats.set(username, {
-            connections: new Map(), // key: net.Socket, value: {id, clientIp, startTime}
+            connections: new Map(), // key: net.Socket, value: {id, clientIp, startTime, username}
             ip_map: new Map(), 
             traffic_delta: { upload: 0, download: 0 }, 
             traffic_live: { upload: 0, download: 0 }, 
@@ -369,6 +369,44 @@ function attemptIpcReconnect() {
     ipcReconnectTimer = setTimeout(connectToIpcServer, delay);
 }
 
+/**
+ * [V9.7 FIX] 提取公共函数，用于根据请求类型（单用户/全局）获取元数据
+ * @param {string | null} username - 目标用户，如果为 null 则返回所有用户
+ * @returns {Array<object>} connections - 格式：[{id, ip, start, workerId, username}]
+ */
+function getConnectionsMetadata(username) {
+    const connections = [];
+    if (username) {
+        // 单用户查询
+        const stats = userStats.get(username);
+        if (stats) {
+            stats.connections.forEach(meta => {
+                connections.push({
+                    id: meta.id,
+                    ip: meta.clientIp,
+                    start: meta.startTime,
+                    workerId: WORKER_ID,
+                    username: meta.username // [V9.7 FIX] 确保包含 username
+                });
+            });
+        }
+    } else {
+        // 全局查询
+        for (const [user, stats] of userStats.entries()) {
+             stats.connections.forEach(meta => {
+                connections.push({
+                    id: meta.id,
+                    ip: meta.clientIp,
+                    start: meta.startTime,
+                    workerId: WORKER_ID,
+                    username: meta.username // [V9.7 FIX] 确保包含 username
+                });
+            });
+        }
+    }
+    return connections;
+}
+
 
 function connectToIpcServer() {
     if (ipcReconnectTimer) {
@@ -442,23 +480,16 @@ function connectToIpcServer() {
                     loadHostWhitelist();
                     break;
                 case 'GET_METADATA':
-                     if (message.username && message.requestId) {
-                         const stats = userStats.get(message.username);
-                         const connections = [];
-                         if (stats) {
-                            stats.connections.forEach(meta => {
-                                connections.push({
-                                    id: meta.id,
-                                    ip: meta.clientIp,
-                                    start: meta.startTime,
-                                    workerId: WORKER_ID 
-                                });
-                            });
-                         }
+                case 'GET_ALL_METADATA': // [V9.7 FIX] 新增全局查询动作
+                     if (message.requestId) {
+                         const targetUsername = (message.action === 'GET_METADATA' && message.username) ? message.username : null;
+                         
+                         const connections = getConnectionsMetadata(targetUsername); // 使用重构后的函数
+
                          ws.send(JSON.stringify({
                              type: 'METADATA_RESPONSE',
                              requestId: message.requestId,
-                             username: message.username,
+                             username: targetUsername, // 可能是 null
                              workerId: WORKER_ID,
                              connections: connections
                          }));
@@ -879,11 +910,13 @@ function handleClient(clientSocket, isTls) {
                 const stats = getUserStat(username);
                 
                 const connectionId = crypto.randomUUID();
+                // [V9.7 FIX] 在 connection meta 中保存 username
                 stats.connections.set(clientSocket, {
                     id: connectionId,
                     clientIp: clientIp,
                     startTime: new Date().toISOString(),
-                    workerId: WORKER_ID
+                    workerId: WORKER_ID,
+                    username: username // 关键：保存用户名
                 });
                 
                 stats.ip_map.set(clientIp, clientSocket);
