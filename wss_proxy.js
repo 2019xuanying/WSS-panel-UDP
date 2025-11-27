@@ -1,12 +1,13 @@
 /**
  * WSS Proxy Core (Node.js)
- * V9.0.0 (Axiom Security Hardening - Anti-Probing & DoS Protection)
+ * V9.6.0 (Axiom Stealth - Smart Dual-Mode)
  *
- * [ARCHITECT REVIEW]
- * - [SECURITY] 实施了 "主动探测欺骗" (Active Probing Deception)。
- * 当 Host/Auth 失败时，不再返回 403/401 错误码，而是伪装成通用的 Nginx 欢迎页面 (HTTP 200)。
- * - [STABILITY] 增加了 MAX_HEADER_SIZE (16KB) 限制，防止内存耗尽攻击 (DoS)。
- * - [NET] 优化了 Socket 销毁逻辑，减少 TIME_WAIT 状态。
+ * [ARCHITECT REVIEW V9.6.0]
+ * - [STEALTH] 真实网站回落 (Real-Site Fallback): 非法流量（Host不匹配/协议错误）会被透明代理到 FALLBACK_TARGET (如 www.bing.com)。
+ * 探测者将看到真实的 Bing 响应，而不是静态页面。
+ * - [COMPATIBILITY] 宽松的 Payload Eater: 在 WebSocket 握手后，优先尝试寻找 SSH-2.0- 标记并清洗数据。
+ * 如果找不到标记但有数据（针对非标准客户端），则回退到“原样转发”模式，确保连接不中断。
+ * - [PERFORMANCE] 集成了 V9.x 的 IPC 性能优化（紧凑数组推送、僵尸连接修复）。
  */
 
 const net = require('net');
@@ -31,7 +32,7 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            console.log(`[AXIOM V9.0] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
+            console.log(`[AXIOM V9.6] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
         }
     } catch (e) {
         console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。服务将退出。`);
@@ -54,6 +55,10 @@ const PANEL_API_URL = config.panel_api_url;
 const INTERNAL_API_SECRET = config.internal_api_secret;
 const DEFAULT_TARGET = { host: '127.0.0.1', port: INTERNAL_FORWARD_PORT };
 
+// [STEALTH] 真实回落目标 (可以是任何 HTTP 网站)
+// 建议选择一个内容丰富且支持 HTTP 的大站，例如 www.bing.com 或 www.baidu.com
+const FALLBACK_TARGET = { host: 'www.bing.com', port: 80 }; 
+
 // [SECURITY] DoS 防护：最大允许的 HTTP 头部大小 (16KB)
 const MAX_HEADER_SIZE = 16 * 1024;
 const TIMEOUT = 86400000; 
@@ -61,30 +66,8 @@ const BUFFER_SIZE = 65536;
 const CERT_FILE = '/etc/stunnel/certs/stunnel.pem';
 const KEY_FILE = '/etc/stunnel/certs/stunnel.key';
 
-// [SECURITY] 伪装响应 (Decoy Responses)
-// 只有 SWITCH_RESPONSE 是真实的业务响应。其他的用于欺骗探测者。
+// [SECURITY] 真实的业务响应
 const SWITCH_RESPONSE = Buffer.from('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
-
-// 伪装成默认的 Nginx 页面，迷惑主动探测
-const DECOY_HTTP_200 = Buffer.from(
-    'HTTP/1.1 200 OK\r\n' +
-    'Server: nginx\r\n' +
-    'Date: ' + new Date().toUTCString() + '\r\n' +
-    'Content-Type: text/html\r\n' +
-    'Connection: close\r\n' +
-    '\r\n' +
-    '<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>'
-);
-
-// 伪装的 404 页面
-const DECOY_HTTP_404 = Buffer.from(
-    'HTTP/1.1 404 Not Found\r\n' +
-    'Server: nginx\r\n' +
-    'Content-Type: text/html\r\n' +
-    'Connection: close\r\n' +
-    '\r\n' +
-    '<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>'
-);
 
 const INTERNAL_ERROR_RESPONSE = Buffer.from('HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n');
 
@@ -125,8 +108,6 @@ class TokenBucket {
         return 0; 
     }
     updateRate(newCapacityKbps, newFillRateKbps) {
-        // const workerId = cluster.isWorker ? `Worker ${cluster.worker.id}` : 'Master(N/A)';
-        // console.log(`[TokenBucket ${workerId}] Updating rate. Capacity: ${newCapacityKbps} KB/s`);
         this._fillTokens();
         this.capacity = Math.max(0, newCapacityKbps * 1024);
         this.fillRate = Math.max(0, newFillRateKbps * 1024 / 1000);
@@ -153,7 +134,12 @@ function getUserStat(username) {
             lastSpeedCalc: { upload: 0, download: 0, time: Date.now() }, 
             bucket_up: new TokenBucket(0, 0),
             bucket_down: new TokenBucket(0, 0),
-            limits: { rate_kbps: 0, max_connections: 0, require_auth_header: 1 }
+            limits: { rate_kbps: 0, max_connections: 0, require_auth_header: 1 },
+            // [V9.5 NEW] 用于追踪自上次推送以来是否有速度/连接/流量变化 (差分更新)
+            hasChanged: false, 
+            lastPushConn: 0,
+            lastPushSpeedUp: 0,
+            lastPushSpeedDown: 0
         });
     }
     return userStats.get(username);
@@ -168,11 +154,25 @@ function calculateSpeeds() {
         const elapsedSeconds = elapsed / 1000.0;
         
         const uploadDelta = stats.traffic_live.upload - stats.lastSpeedCalc.upload;
-        stats.speed_kbps.upload = (uploadDelta / 1024) / elapsedSeconds;
+        const newSpeedUp = (uploadDelta / 1024) / elapsedSeconds;
+        
+        const downloadDelta = stats.traffic_live.download - stats.lastSpeedCalc.download;
+        const newSpeedDown = (downloadDelta / 1024) / elapsedSeconds;
+        
+        const speedChanged = Math.abs(newSpeedUp - stats.speed_kbps.upload) > 0.1 || 
+                             Math.abs(newSpeedDown - stats.speed_kbps.download) > 0.1;
+        
+        const deltaTraffic = stats.traffic_delta.upload + stats.traffic_delta.download;
+        const connChanged = stats.connections.size !== stats.lastPushConn;
+        
+        if (speedChanged || deltaTraffic > 0 || connChanged) {
+             stats.hasChanged = true;
+        }
+
+        stats.speed_kbps.upload = newSpeedUp;
         stats.lastSpeedCalc.upload = stats.traffic_live.upload;
 
-        const downloadDelta = stats.traffic_live.download - stats.lastSpeedCalc.download;
-        stats.speed_kbps.download = (downloadDelta / 1024) / elapsedSeconds;
+        stats.speed_kbps.download = newSpeedDown;
         stats.lastSpeedCalc.download = stats.traffic_live.download;
         
         stats.lastSpeedCalc.time = now;
@@ -192,6 +192,10 @@ function calculateSpeeds() {
                            (pending_traffic_delta[username].upload > 0 || pending_traffic_delta[username].download > 0);
                            
         if (stats.connections.size === 0 && !hasPending) {
+            // [V9.5 BUGFIX] 在删除前，先强制发送归零状态
+            if (stats.lastPushConn > 0) {
+                 pushZeroStatus(username);
+            }
             userStats.delete(username);
             if (pending_traffic_delta[username]) {
                 delete pending_traffic_delta[username];
@@ -212,61 +216,103 @@ let ipcReconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 60000; 
 
 /**
- * [AXIOM V5.0] 实时统计推送器
+ * [V9.5 BUGFIX] 显式推送用户归零状态 (僵尸连接修复)
+ */
+function pushZeroStatus(username) {
+    if (!ipcWsClient || ipcWsClient.readyState !== WebSocket.OPEN) {
+        return; 
+    }
+     const stats = userStats.get(username);
+     if (!stats) return; 
+     
+     stats.lastPushConn = 0;
+     stats.lastPushSpeedUp = 0;
+     stats.lastPushSpeedDown = 0;
+
+     const zeroPacket = [
+        [
+             username, 
+             0, 
+             0, 
+             0, 
+             stats.traffic_delta.upload,
+             stats.traffic_delta.download
+        ]
+     ];
+     
+     stats.traffic_delta.upload = 0;
+     stats.traffic_delta.download = 0;
+     
+     try {
+        ipcWsClient.send(JSON.stringify({
+            type: 'stats_update_compact',
+            workerId: WORKER_ID, 
+            payload: zeroPacket
+        }));
+    } catch (e) {
+        console.error(`[IPC_WSC Worker ${WORKER_ID}] 推送归零状态失败: ${e.message}`);
+    }
+}
+
+
+/**
+ * [AXIOM V9.5] 实时统计推送器 (使用紧凑数组)
  */
 function pushStatsToControlPlane(ws_client) {
     if (!ws_client || ws_client.readyState !== WebSocket.OPEN) {
         return; 
     }
 
-    const statsReport = {};
-    const liveIps = {};
-    
-    let hasPushableData = false;
     for (const username in pending_traffic_delta) {
         const stats = getUserStat(username); 
         stats.traffic_delta.upload += pending_traffic_delta[username].upload;
         stats.traffic_delta.download += pending_traffic_delta[username].download;
+        if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+             stats.hasChanged = true;
+        }
         delete pending_traffic_delta[username];
     }
     
+    const compactStatsArray = [];
+    
     for (const [username, stats] of userStats.entries()) {
-        if (stats.connections.size > 0 || stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+        const speedUp = parseFloat(stats.speed_kbps.upload.toFixed(1));
+        const speedDown = parseFloat(stats.speed_kbps.download.toFixed(1));
+        
+        const hasSignificantChange = 
+            stats.hasChanged || 
+            stats.connections.size !== stats.lastPushConn || 
+            speedUp !== stats.lastPushSpeedUp || 
+            speedDown !== stats.lastPushSpeedDown; 
+
+        if (hasSignificantChange) {
+            compactStatsArray.push([
+                username, 
+                stats.connections.size, 
+                speedUp, 
+                speedDown,
+                stats.traffic_delta.upload,
+                stats.traffic_delta.download
+            ]);
             
-            statsReport[username] = {
-                speed_kbps: stats.speed_kbps, 
-                connections: stats.connections.size, 
-                traffic_delta_up: stats.traffic_delta.upload,
-                traffic_delta_down: stats.traffic_delta.download,
-                source: 'wss'
-            };
-
-            if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
-                 hasPushableData = true;
-            }
-
             stats.traffic_delta.upload = 0;
             stats.traffic_delta.download = 0;
-            
-            for (const ip of stats.ip_map.keys()) {
-                liveIps[ip] = username;
-            }
+            stats.lastPushConn = stats.connections.size;
+            stats.lastPushSpeedUp = speedUp;
+            stats.lastPushSpeedDown = speedDown;
+            stats.hasChanged = false; 
         }
     }
 
-    if (Object.keys(statsReport).length > 0 || Object.keys(liveIps).length > 0 || hasPushableData) {
+    if (compactStatsArray.length > 0) {
          try {
             ws_client.send(JSON.stringify({
-                type: 'stats_update',
+                type: 'stats_update_compact', 
                 workerId: WORKER_ID, 
-                payload: { 
-                    stats: statsReport, 
-                    live_ips: liveIps,
-                    ping: true 
-                }
+                payload: compactStatsArray 
             }));
         } catch (e) {
-            console.error(`[IPC_WSC Worker ${WORKER_ID}] 推送统计数据失败: ${e.message}`);
+            console.error(`[IPC_WSC Worker ${WORKER_ID}] 推送紧凑统计数据失败: ${e.message}`);
         }
     }
 }
@@ -286,7 +332,6 @@ function kickUser(username) {
 function updateUserLimits(username, limits) {
     if (!limits) return;
     const stats = getUserStat(username); 
-    // console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在更新用户 ${username} 的限制...`);
     stats.limits = {
         rate_kbps: limits.rate_kbps || 0,
         max_connections: limits.max_connections || 0,
@@ -305,6 +350,7 @@ function resetUserTraffic(username) {
         stats.traffic_delta = { upload: 0, download: 0 };
         stats.traffic_live = { upload: 0, download: 0 };
         stats.lastSpeedCalc = { upload: 0, download: 0, time: Date.now() };
+        stats.hasChanged = true; 
         if (pending_traffic_delta[username]) {
              delete pending_traffic_delta[username];
         }
@@ -316,13 +362,10 @@ function attemptIpcReconnect() {
         clearTimeout(ipcReconnectTimer);
         ipcReconnectTimer = null;
     }
-    
     const baseDelay = Math.pow(2, ipcReconnectAttempts) * 1000;
     const delay = Math.min(baseDelay, MAX_RECONNECT_DELAY_MS);
-
     ipcReconnectAttempts++;
     console.warn(`[IPC_WSC Worker ${WORKER_ID}] 正在重试连接 (尝试次数: ${ipcReconnectAttempts}, 延迟: ${delay / 1000}s)...`);
-
     ipcReconnectTimer = setTimeout(connectToIpcServer, delay);
 }
 
@@ -388,6 +431,7 @@ function connectToIpcServer() {
                 case 'delete':
                     if (message.username) {
                         kickUser(message.username); 
+                        pushZeroStatus(message.username);
                         if (userStats.has(message.username)) {
                             userStats.delete(message.username); 
                         }
@@ -591,7 +635,7 @@ async function checkConcurrency(username, maxConnections) {
 }
 
 
-// --- Client Handler ---
+// --- Client Handler (Core Logic with Fallback) ---
 function handleClient(clientSocket, isTls) {
     
     let clientIp = clientSocket.remoteAddress;
@@ -613,43 +657,57 @@ function handleClient(clientSocket, isTls) {
     clientSocket.setTimeout(TIMEOUT);
     clientSocket.setKeepAlive(true, 60000);
 
-    // [SECURITY] 辅助函数：发送伪装响应并关闭连接
-    const sendDecoyAndClose = (type) => {
-        if (!clientSocket.writable) return;
+    // [STEALTH] 核心功能：将非法流量透明转发到回落目标 (Real-Site)
+    // 无论是爬虫、浏览器直接访问，还是错误的鉴权，都会被“喂”给这个真实网站。
+    const proxyToFallback = (initialData) => {
+        // 防止重复调用
+        if (state === 'fallback' || clientSocket.destroyed) return;
+        state = 'fallback';
+
+        logConnection(clientIp, clientPort, localPort, 'N/A', `REDIRECTING_TO_FALLBACK (${FALLBACK_TARGET.host})`);
+
+        const fallbackSocket = net.connect(FALLBACK_TARGET.port, FALLBACK_TARGET.host, () => {
+            // 收到连接后，发送客户端的原始数据
+            if (initialData && initialData.length > 0) {
+                fallbackSocket.write(initialData);
+            }
+            // 建立双向管道：Client <-> Fallback Site
+            clientSocket.pipe(fallbackSocket).pipe(clientSocket);
+        });
+
+        fallbackSocket.on('error', (err) => {
+            console.error(`[FALLBACK_ERR] Worker ${WORKER_ID} Failed to connect to fallback (${FALLBACK_TARGET.host}): ${err.message}`);
+            clientSocket.destroy(); // 回落目标挂了，断开客户端
+        });
         
-        if (type === '404') {
-            clientSocket.end(DECOY_HTTP_404);
-        } else {
-            // Default 200 OK Nginx Welcome
-            clientSocket.end(DECOY_HTTP_200);
-        }
-        // 不立即 destroy，让数据发完
-        setTimeout(() => {
-            if (!clientSocket.destroyed) clientSocket.destroy();
-        }, 2000);
+        // 当回落目标关闭连接时，我们也关闭客户端
+        fallbackSocket.on('close', () => {
+            if (!clientSocket.destroyed) clientSocket.end(); 
+        });
+        
+        // 错误处理：确保两端错误都会导致双方断开
+        clientSocket.on('error', () => fallbackSocket.destroy());
     };
 
     clientSocket.on('error', (err) => {
-        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ETIMEDOUT') {
-            // console.error(`[WSS_ERR] Client Socket Error: ${err.message}`);
-        }
         if (remoteSocket) remoteSocket.destroy();
         clientSocket.destroy();
     });
 
     clientSocket.on('timeout', () => {
-        // console.log(`[WSS_TIMEOUT] Client Socket Timeout`);
         if (remoteSocket) remoteSocket.destroy();
         clientSocket.destroy();
     });
     
     clientSocket.on('close', () => {
-        if (remoteSocket) remoteSocket.destroy();
+        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
         if (username) {
             try {
                 const stats = getUserStat(username);
+                // [V9.5 BUGFIX] 标记连接数变化
                 stats.connections.delete(clientSocket);
                 stats.ip_map.delete(clientIp);
+                stats.hasChanged = true;
             } catch (e) {}
             logConnection(clientIp, clientPort, localPort, username, 'CONN_END');
         }
@@ -664,16 +722,22 @@ function handleClient(clientSocket, isTls) {
             const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
             stats.traffic_delta.upload += dataToWrite.length;
             stats.traffic_live.upload += dataToWrite.length;
+            stats.hasChanged = true; // 标记有流量变化
             if (remoteSocket && remoteSocket.writable) {
                 remoteSocket.write(dataToWrite);
             }
             return;
         }
 
+        if (state === 'fallback') {
+            // 已经处于回落状态，将数据直接写入回落 socket (由 proxyToFallback 接管)
+            return;
+        }
+
         // [SECURITY] DoS 防护：检查缓冲区大小
         if (fullRequest.length + data.length > MAX_HEADER_SIZE) {
             logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_DOS_HEADER_SIZE');
-            clientSocket.destroy(); // 直接切断，不给任何响应
+            clientSocket.destroy(); // 直接切断
             return;
         }
 
@@ -695,8 +759,8 @@ function handleClient(clientSocket, isTls) {
             
             // 1. Host 检查 (Anti-Probing)
             if (!checkHost(headers)) {
-                logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HOST_DECOY');
-                sendDecoyAndClose('200'); // 伪装成 Nginx 欢迎页
+                logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HOST_FALLBACK');
+                proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders])); 
                 return; 
             }
             
@@ -704,21 +768,14 @@ function handleClient(clientSocket, isTls) {
             
             const isWebsocketRequest = headers.includes('Upgrade: websocket') || 
                                        headers.includes('Connection: Upgrade') || 
-                                       headers.includes('GET-RAY'); // Legacy support
+                                       headers.includes('GET-RAY'); 
 
             // 2. 协议检查 (Anti-Probing)
             if (!isWebsocketRequest) {
-                 if (auth) {
-                    // 带了认证头但不是 Websocket，可能是扫描器
-                    logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_AUTH_NOT_WEBSOCKET');
-                    sendDecoyAndClose('404');
-                    return; 
-                 }
-                 // 哑请求：通常返回 HTTP 200 是为了通过某些简单的健康检查，
-                 // 但为了隐身，我们返回 Decoy Nginx 页面
-                 logConnection(clientIp, clientPort, localPort, 'N/A', 'DUMMY_HTTP_REQUEST_DECOY');
-                 clientSocket.end(DECOY_HTTP_200);
-                 continue; 
+                 // 哑请求或纯 HTTP 流量，直接代理到回落网站
+                 logConnection(clientIp, clientPort, localPort, 'N/A', 'DUMMY_HTTP_REQUEST_FALLBACK');
+                 proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders]));
+                 return; 
             }
             
             // --- 认证流程 ---
@@ -728,14 +785,13 @@ function handleClient(clientSocket, isTls) {
                 authResult = await authenticateUser(auth.username, auth.password);
                 
                 if (authResult.status === 503) {
-                    // API 挂了，返回 500
                     clientSocket.end(INTERNAL_ERROR_RESPONSE);
                     return;
                 }
                 if (!authResult.success) {
-                    logConnection(clientIp, clientPort, localPort, username, `AUTH_FAILED_DECOY (${authResult.message})`);
-                    // [SECURITY] 认证失败，返回 404 而不是 401，防止爆破确认用户名存在
-                    sendDecoyAndClose('404');
+                    logConnection(clientIp, clientPort, localPort, username, `AUTH_FAILED_FALLBACK (${authResult.message})`);
+                    // 认证失败，代理到回落网站
+                    proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders])); 
                     return; 
                 }
                 limits = authResult.limits; 
@@ -746,14 +802,14 @@ function handleClient(clientSocket, isTls) {
                 const uriMatch = headers.match(/GET\s+\/\?user=([a-z0-9_]{3,16})/i);
                 
                 if (requireAuthHeader === 1) { 
-                    logConnection(clientIp, clientPort, localPort, 'N/A', 'AUTH_MISSING_DECOY');
-                    sendDecoyAndClose('200'); // 假装是正常网页
+                    logConnection(clientIp, clientPort, localPort, 'N/A', 'AUTH_MISSING_FALLBACK');
+                    proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders])); 
                     return;
                 }
 
                 if (!uriMatch) {
-                    logConnection(clientIp, clientPort, localPort, 'N/A', 'URI_AUTH_MISSING_DECOY');
-                    sendDecoyAndClose('200');
+                    logConnection(clientIp, clientPort, localPort, 'N/A', 'URI_AUTH_MISSING_FALLBACK');
+                    proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders]));
                     return; 
                 }
                 
@@ -772,8 +828,8 @@ function handleClient(clientSocket, isTls) {
                     logConnection(clientIp, clientPort, localPort, username, 'AUTH_LITE_SUCCESS');
                     
                 } else {
-                    logConnection(clientIp, clientPort, localPort, tempUsername, 'AUTH_LITE_FAILED_DECOY');
-                    sendDecoyAndClose('404');
+                    logConnection(clientIp, clientPort, localPort, tempUsername, 'AUTH_LITE_FAILED_FALLBACK');
+                    proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders]));
                     return; 
                 }
             }
@@ -781,8 +837,8 @@ function handleClient(clientSocket, isTls) {
             // --- 并发检查 ---
             if (!await checkConcurrency(username, limits.max_connections)) {
                 logConnection(clientIp, clientPort, localPort, username, `REJECTED_CONCURRENCY`);
-                // 并发超限，可以返回 429，或者为了隐蔽直接断开
-                clientSocket.destroy(); 
+                // 并发超限，代理到回落网站 (以避免返回可追踪的 429 或 403 错误码)
+                proxyToFallback(Buffer.concat([headersRaw, Buffer.from('\r\n\r\n'), dataAfterHeaders])); 
                 return; 
             }
             
@@ -792,7 +848,11 @@ function handleClient(clientSocket, isTls) {
             const initialSshData = fullRequest;
             fullRequest = Buffer.alloc(0); 
 
-            // --- Payload Eater / 分割载荷处理 ---
+            // --- Payload Eater / 分割载荷处理 (V8.6.0 Logic - Loose Mode) ---
+            // [AXIOM V9.5 CRITICAL FIX] 使用宽松的检测逻辑。
+            // 如果找到 SSH-2.0- 标记，则截断前面的垃圾数据。
+            // 如果没有找到标记，但有数据，则原样转发（兼容非标准客户端）。
+            
             const sshVersionMarker = Buffer.from('SSH-2.0-');
             const sshStartIndex = initialSshData.indexOf(sshVersionMarker);
             
@@ -827,6 +887,7 @@ function handleClient(clientSocket, isTls) {
                 });
                 
                 stats.ip_map.set(clientIp, clientSocket);
+                stats.hasChanged = true; // 标记连接数变化
                 
                 state = 'forwarding';
                 
@@ -842,6 +903,7 @@ function handleClient(clientSocket, isTls) {
                     const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
                     stats.traffic_delta.download += dataToWrite.length;
                     stats.traffic_live.download += dataToWrite.length;
+                    stats.hasChanged = true; // 标记有流量变化
                     if (clientSocket.writable) {
                         clientSocket.write(dataToWrite);
                     }
@@ -892,45 +954,9 @@ function startInternalApiServer() {
             try {
                 if (req.method === 'GET' && req.url === '/stats') {
                     internalApiSecretMiddleware(req, res, () => {
-                        allWorkerStats.clear();
-                        for (const id in cluster.workers) {
-                            cluster.workers[id].send({ type: 'GET_STATS' });
-                        }
-                        
-                        setTimeout(() => {
-                            const aggregatedStats = {};
-                            const aggregatedLiveIps = {};
-
-                            for (const [workerId, workerData] of allWorkerStats.entries()) {
-                                for (const username in workerData.stats) {
-                                    if (!aggregatedStats[username]) {
-                                        aggregatedStats[username] = { ...workerData.stats[username] };
-                                    } else {
-                                        const existing = aggregatedStats[username];
-                                        const current = workerData.stats[username];
-                                        existing.traffic_delta_up += current.traffic_delta_up;
-                                        existing.traffic_delta_down += current.traffic_delta_down;
-                                        existing.connections += current.connections;
-                                        existing.speed_kbps.upload += current.speed_kbps.upload;
-                                        existing.speed_kbps.download += current.speed_kbps.download;
-                                    }
-                                }
-                                Object.assign(aggregatedLiveIps, workerData.live_ips);
-                            }
-                            
-                            for (const username in aggregatedStats) {
-                                const user = aggregatedStats[username];
-                                user.traffic_delta = user.traffic_delta_up + user.traffic_delta_down;
-                                delete user.traffic_delta_up;
-                                delete user.traffic_delta_down;
-                            }
-                            
-                            const finalResponse = { ...aggregatedStats, live_ips: aggregatedLiveIps };
-                            
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(finalResponse));
-                            
-                        }, 250); 
+                        // [V9.5 OPT] 移除 Master 聚合 API
+                        res.writeHead(501, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, message: 'API /stats is deprecated. Use IPC for real-time aggregation.' }));
                     });
                 } else {
                     res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1014,14 +1040,11 @@ if (cluster.isPrimary) {
     startInternalApiServer();
     
     cluster.on('message', (worker, message) => {
-        if (message && message.type === 'STATS_RESPONSE' && message.data) {
-            allWorkerStats.set(worker.id, message.data);
-        }
+        // [V9.5 OPT] 移除 Master 上的 STATS_RESPONSE 逻辑
     });
 
     cluster.on('exit', (worker, code, signal) => {
         console.error(`[AXIOM Cluster Master] Worker ${worker.process.pid} died. Forking replacement...`);
-        allWorkerStats.delete(worker.id);
         cluster.fork();
     });
 
@@ -1032,37 +1055,7 @@ if (cluster.isPrimary) {
     startServers();
     
     process.on('message', (msg) => {
-        if (msg && msg.type === 'GET_STATS') {
-            
-            const statsReport = {};
-            const liveIps = {};
-            
-            for (const [username, stats] of userStats.entries()) {
-                if (stats.connections.size > 0 || stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
-                    statsReport[username] = {
-                        traffic_delta_up: stats.traffic_delta.upload,
-                        traffic_delta_down: stats.traffic_delta.download,
-                        speed_kbps: stats.speed_kbps,
-                        connections: stats.connections.size,
-                        source: 'wss'
-                    };
-                    stats.traffic_delta.upload = 0;
-                    stats.traffic_delta.download = 0;
-                    for (const ip of stats.ip_map.keys()) {
-                        liveIps[ip] = username;
-                    }
-                }
-            }
-            
-            process.send({ 
-                type: 'STATS_RESPONSE', 
-                data: { 
-                    stats: statsReport, 
-                    live_ips: liveIps,
-                    pending_traffic: pending_traffic_delta 
-                } 
-            });
-        }
+        // [V9.5 OPT] 移除 Master 轮询请求，数据推送改为主动 IPC
     });
     
     process.on('uncaughtException', (err, origin) => {
