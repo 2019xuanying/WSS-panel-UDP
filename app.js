@@ -488,6 +488,9 @@ function renderUserQuickStats(stats) {
  * [AXIOM V5.2] 重构: buildUserCard (移动端)
  */
 function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, toggleColor, usageText, usageProgressHtml) {
+    // [V6.0 FIX] 确保 maxConnections 变量被正确定义
+    const maxConnections = user.max_connections !== undefined ? user.max_connections : 0; 
+    
     let borderColor = 'border-primary';
     if (user.status === 'active') borderColor = 'border-success';
     if (user.status === 'paused' || user.status === 'fused') borderColor = 'border-warning';
@@ -529,7 +532,7 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
                 <p><strong>连接/并发:</strong> 
                     <!-- [AXIOM V3.1] 新增 ID -->
                     <span id="conn-mobile-${user.username}" class="font-medium text-primary">${activeConnections}</span> / 
-                    <span class="font-medium text-base-content">${formatConnections(user.max_connections)}</span>
+                    <span class="font-medium text-base-content">${formatConnections(maxConnections)}</span>
                 </p>
                 
                 <p class="speed-mobile"><strong>实时:</strong> 
@@ -547,7 +550,7 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
                 <button onclick="openTrafficChartModal('${user.username}')"
                         class="btn btn-secondary btn-xs" aria-label="流量图 ${user.username}">流量图</button>
                 
-                <button onclick="openSettingsModal('${user.username}', '${user.expiration_date || ''}', ${user.quota_gb}, '${user.rate_kbps}', '${user.max_connections}', '${user.fuse_threshold_kbps}', ${user.require_auth_header}, ${user.allow_shell})" 
+                <button onclick="openSettingsModal('${user.username}', '${user.expiration_date || ''}', ${user.quota_gb}, '${user.rate_kbps}', '${maxConnections}', '${user.fuse_threshold_kbps}', ${user.require_auth_header}, ${user.allow_shell})" 
                         class="btn btn-primary btn-xs" aria-label="设置 ${user.username}">设置</button>
                         
                 <button onclick="confirmAction('${user.username}', '${toggleAction}', null, 'toggleStatus', '${toggleText}用户')" 
